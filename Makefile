@@ -1,9 +1,78 @@
-# VERSION defines the project version for the bundle.
+include dev.env
+
+# PROJECT_VERSION defines the project version for the bundle.
 # Update this value when you upgrade the version of your project.
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
-# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
-# - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 0.0.1
+# - use the PROJECT_VERSION as arg of the bundle target (e.g make bundle PROJECT_VERSION=0.0.2)
+# - use environment variables to overwrite this value (e.g export PROJECT_VERSION=0.0.2)
+PROJECT_VERSION ?= v1.0.0
+YAML_FILES=bundle/manifests/amd-gpu-operator-node-metrics_rbac.authorization.k8s.io_v1_rolebinding.yaml bundle/manifests/amd-gpu-operator.clusterserviceversion.yaml bundle/manifests/amd-gpu-operator-node-labeller_rbac.authorization.k8s.io_v1_clusterrolebinding.yaml bundle/manifests/amd-gpu-operator-node-metrics_monitoring.coreos.com_v1_servicemonitor.yaml config/samples/amd.com_deviceconfigs.yaml config/manifests/bases/amd-gpu-operator.clusterserviceversion.yaml example/deviceconfig_example.yaml config/default/kustomization.yaml
+CRD_YAML_FILES = deviceconfig-crd.yaml
+K8S_KMM_CRD_YAML_FILES=module-crd.yaml nodemodulesconfig-crd.yaml
+OPENSHIFT_KMM_CRD_YAML_FILES=module-crd.yaml nodemodulesconfig-crd.yaml
+OPENSHIFT_CLUSTER_NFD_CRD_YAML_FILES=nodefeature-crd.yaml nodefeaturediscovery-crd.yaml nodefeaturerule-crd.yaml noderesourcetopology-crd.yaml
+
+ifdef OPENSHIFT
+$(info selected openshift)
+GPU_OPERATOR_CHART ?= ./helm-charts-openshift/gpu-operator-helm-openshift-$(PROJECT_VERSION).tgz
+KUBECTL_CMD=oc
+HELM_OC_CMD=--set platform=openshift
+else
+GPU_OPERATOR_CHART ?= ./helm-charts-k8s/gpu-operator-helm-k8s-$(PROJECT_VERSION).tgz
+$(info selected k8s)
+KUBECTL_CMD=kubectl
+endif
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD)
+
+ifdef SKIP_NFD
+ifdef OPENSHIFT
+SKIP_NFD_CMD=--set nfd.enabled=false
+else
+SKIP_NFD_CMD=--set node-feature-discovery.enabled=false
+endif
+endif
+
+ifdef SKIP_KMM
+SKIP_KMM_CMD=--set kmm.enabled=false
+endif
+
+# IMAGE_NAME defines the docker.io namespace and part of the image name for remote images.
+# This variable is used to construct full image tags for bundle and catalog images.
+#
+# For example, running 'make bundle-build bundle-push catalog-build catalog-push' will build and push both
+# Specify DOCKER_REGISTRY as registryURL/username
+# Note: when using images from DockerHub, please make sure to input the full DockerHub registry URL (docker.io) into DOCKER_REGISTRY
+# user's container runtime may not set DockerHub as default registry and auto-search on DockerHub
+DOCKER_REGISTRY ?= registry.test.pensando.io:5000
+IMAGE_NAME ?= amd-gpu-operator
+IMAGE_TAG_BASE ?= $(DOCKER_REGISTRY)/$(IMAGE_NAME)
+# This is the default tag of all images made by this Makefile.
+IMAGE_TAG ?= dev
+# Image URL to use all building/pushing image targets
+IMG ?= $(IMAGE_TAG_BASE):$(IMAGE_TAG)
+
+# name used for saving the container images as tar.gz
+DOCKER_CONTAINER_IMG = $(IMAGE_NAME)-$(IMAGE_TAG)
+
+# BUNDLE_IMG defines the image:tag used for the bundle.
+# You can use it as an arg. (E.g make bundle-build BUNDLE_IMG=<some-registry>/<project-name-bundle>:<tag>)
+BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-bundle:$(PROJECT_VERSION)
+INDEX_IMG := $(IMAGE_TAG_BASE)-index:$(PROJECT_VERSION)
+BUNDLE_NAMESPACE ?= default # the namespace to deploy the OLM bundle
+
+HOURLY_TAG_LABEL ?= latest
+
+# KMM related images
+KMM_IMAGE_TAG ?= dev
+KMM_SIGNER_IMG ?= registry.test.pensando.io:5000/kernel-module-management-signimage:$(KMM_IMAGE_TAG)
+KMM_WORKER_IMG ?= registry.test.pensando.io:5000/kernel-module-management-worker:$(KMM_IMAGE_TAG)
+KMM_BUILDER_IMG ?= gcr.io/kaniko-project/executor:v1.23.2
+KMM_WEBHOOK_IMG_NAME ?= registry.test.pensando.io:5000/kernel-module-management-webhook-server
+KMM_OPERATOR_IMG_NAME ?= registry.test.pensando.io:5000/kernel-module-management-operator
+
+# CICD test image
+TEST_CONTAINER_URL ?= registry.test.pensando.io:5000/pensando/gpu-op
+TEST_CONTAINER_VERSION ?=1.0
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -24,37 +93,27 @@ BUNDLE_DEFAULT_CHANNEL := --default-channel=$(DEFAULT_CHANNEL)
 endif
 BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 
-# IMAGE_TAG_BASE defines the docker.io namespace and part of the image name for remote images.
-# This variable is used to construct full image tags for bundle and catalog images.
-#
-# For example, running 'make bundle-build bundle-push catalog-build catalog-push' will build and push both
-# amd.com/gpu-operator-bundle:$VERSION and amd.com/gpu-operator-catalog:$VERSION.
-IMAGE_TAG_BASE ?= amd.com/gpu-operator
-
-# BUNDLE_IMG defines the image:tag used for the bundle.
-# You can use it as an arg. (E.g make bundle-build BUNDLE_IMG=<some-registry>/<project-name-bundle>:<tag>)
-BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-bundle:v$(VERSION)
-
 # BUNDLE_GEN_FLAGS are the flags passed to the operator-sdk generate bundle command
-BUNDLE_GEN_FLAGS ?= -q --overwrite --version $(VERSION) $(BUNDLE_METADATA_OPTS)
+BUNDLE_GEN_FLAGS ?= -q --overwrite --version $(shell echo $(PROJECT_VERSION) | sed 's/^v//') $(BUNDLE_METADATA_OPTS)
 
-# USE_IMAGE_DIGESTS defines if images are resolved via tags or digests
-# You can enable this value if you would like to use SHA Based Digests
-# To enable set flag to true
-USE_IMAGE_DIGESTS ?= false
-ifeq ($(USE_IMAGE_DIGESTS), true)
-	BUNDLE_GEN_FLAGS += --use-image-digests
+# ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
+ENVTEST_K8S_VERSION = 1.23
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
 endif
 
-# Set the Operator SDK version to use. By default, what is installed on the system is used.
-# This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
-OPERATOR_SDK_VERSION ?= v1.32.0
-
-# Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# This is a requirement for 'setup-envtest.sh' in the test target.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
 
 .PHONY: all
-all: docker-build
+all: generate manager manifests docker-build helm-k8s helm-openshift bundle-build
 
 ##@ General
 
@@ -73,158 +132,377 @@ all: docker-build
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
+##@ Development
+
+.PHONY: manifests update-registry
+update-registry:
+	# updating registry information in yaml files
+	sed -i -e 's|image:.*$$|image: ${IMG}|' bundle/manifests/amd-gpu-operator.clusterserviceversion.yaml
+	sed -i -e 's|repository:.*$$|repository: ${IMAGE_TAG_BASE}|' \
+	hack/k8s-patch/metadata-patch/values.yaml \
+	hack/openshift-patch/metadata-patch/values.yaml
+	sed -i -e "s/newTag:.*$$/newTag: ${IMAGE_TAG}/" -e "s/tag:.*$$/tag: ${IMAGE_TAG}/" \
+	-e 's|registry.test.pensando.io:5000|$(DOCKER_REGISTRY)|' \
+	-e 's|newName:.*$$|newName: ${IMAGE_TAG_BASE}|' \
+	config/manager-base/kustomization.yaml config/manager/kustomization.yaml \
+	hack/k8s-patch/metadata-patch/values.yaml helm-charts-k8s/values.yaml \
+	hack/openshift-patch/metadata-patch/values.yaml helm-charts-openshift/values.yaml \
+	example/deviceconfig_example.yaml
+	sed -i -e 's|tag:.*$$|tag: ${KMM_IMAGE_TAG}|' \
+	-e 's|repository:.*operator.*$$|repository: ${KMM_OPERATOR_IMG_NAME}|' \
+	-e 's|repository:.*webhook.*$$|repository: ${KMM_WEBHOOK_IMG_NAME}|' \
+	-e 's|relatedImageBuild:.*$$|relatedImageBuild: ${KMM_BUILDER_IMG}|' \
+	-e 's|relatedImageSign:.*$$|relatedImageSign: ${KMM_SIGNER_IMG}|' \
+	-e 's|relatedImageWorker:.*$$|relatedImageWorker: ${KMM_WORKER_IMG}|' \
+	hack/k8s-patch/k8s-kmm-patch/metadata-patch/values.yaml
+
+manifests: controller-gen update-registry ## Generate ClusterRole and CustomResourceDefinition objects.
+	$(CONTROLLER_GEN) crd paths="./api/..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role paths="./internal/controllers" output:rbac:artifacts:config=config/rbac
+
+.PHONY: generate
+generate: controller-gen mockgen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+	go generate ./...
+
+.PHONY: fmt
+fmt: ## Run go fmt against code.
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
+
+UNIT_TEST ?= ./internal/controllers ./internal/kmmmodule
+
+.PHONY: unit-test
+unit-test: vet ## Run tests.
+	go test $(UNIT_TEST) -v -coverprofile cover.out
+
+#GPU_OPERATOR_RELEASE=$(shell helm version > /dev/null && helm list --deployed -n kube-amd-gpu -q)
+.PHONY: e2e
+e2e:
+	$(info deploying ${GPU_OPERATOR_CHART})
+	${MAKE} helm-install
+	export OPENSHIFT
+	export NOAMDGPU
+	${MAKE} -C tests/e2e
+	${MAKE} helm-uninstall
+
+GOFILES_NO_VENDOR = $(shell find . -type f -name '*.go' -not -path "./vendor/*")
+.PHONY: lint
+lint: golangci-lint ## Run golangci-lint against code.
+	@if [ `gofmt -l $(GOFILES_NO_VENDOR) | wc -l` -ne 0 ]; then \
+		echo There are some malformed files, please make sure to run \'make fmt\'; \
+		gofmt -l $(GOFILES_NO_VENDOR); \
+		exit 1; \
+	fi
+	$(GOLANGCI_LINT) run -v --timeout 5m0s
+
 ##@ Build
 
-.PHONY: run
-run: helm-operator ## Run against the configured Kubernetes cluster in ~/.kube/config
-	$(HELM_OPERATOR) run
+manager: $(shell find -name "*.go") go.mod go.sum  ## Build manager binary.
+	go build -ldflags="-X main.Version=$(PROJECT_VERSION) -X main.GitCommit=$(GIT_COMMIT)" -o $@ ./cmd
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	docker build -t ${IMG} .
+	docker build -t $(IMG) --label HOURLY_TAG=$(HOURLY_TAG_LABEL) --build-arg TARGET=manager .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
-	docker push ${IMG}
+	docker push $(IMG)
 
-# PLATFORMS defines the target platforms for  the manager image be build to provide support to multiple
-# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
-# - able to use docker buildx . More info: https://docs.docker.com/build/buildx/
-# - have enable BuildKit, More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-# - be able to push the image for your registry (i.e. if you do not inform a valid value via IMG=<myregistry/image:<tag>> than the export will fail)
-# To properly provided solutions that supports more than one platform you should use this option.
-PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
-.PHONY: docker-buildx
-docker-buildx: test ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
-	- docker buildx create --name project-v3-builder
-	docker buildx use project-v3-builder
-	- docker buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
-	- docker buildx rm project-v3-builder
-	rm Dockerfile.cross
+.PHONY: docker-save
+docker-save: ## save the container image with the manager.
+	docker save $(IMG) | gzip > $(DOCKER_CONTAINER_IMG).tar.gz
 
 ##@ Deployment
 
+ifndef ignore-not-found
+  ignore-not-found = false
+endif
+
+KUSTOMIZE_CONFIG_CRD ?= config/crd
+
 .PHONY: install
-install: kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+install: manifests ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+	${KUBECTL_CMD} apply -k $(KUSTOMIZE_CONFIG_CRD)
 
 .PHONY: uninstall
-uninstall: kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | kubectl delete -f -
+uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	${KUBECTL_CMD} delete -k $(KUSTOMIZE_CONFIG_CRD) --ignore-not-found=$(ignore-not-found)
+
+KUSTOMIZE_CONFIG_DEFAULT ?= config/default
+KUSTOMIZE_CONFIG_HUB_DEFAULT ?= config/default-hub
 
 .PHONY: deploy
-deploy: kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
+	${KUBECTL_CMD} apply -k $(KUSTOMIZE_CONFIG_DEFAULT)
+	#$(KUSTOMIZE) build config/default > yaml.file
 
 .PHONY: undeploy
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/default | kubectl delete -f -
+undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	${KUBECTL_CMD} delete deviceconfigs.amd.com -n kube-amd-gpu --all
+	${KUBECTL_CMD} delete -k $(KUSTOMIZE_CONFIG_DEFAULT) --ignore-not-found=$(ignore-not-found)
 
-OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
-ARCH := $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+CONTROLLER_GEN = $(shell pwd)/bin/controller-gen
+.PHONY: controller-gen
+controller-gen: ## Download controller-gen locally if necessary.
+	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.12.0)
 
-.PHONY: kustomize
+GOLANGCI_LINT = $(shell pwd)/bin/golangci-lint
+.PHONY: golangci-lint
+golangci-lint: ## Download golangci-lint locally if necessary.
+	$(call go-get-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint@v1.53.1)
+
+.PHONY: mockgen
+mockgen: ## Install mockgen locally.
+	go install go.uber.org/mock/mockgen@v0.3.0
+
 KUSTOMIZE = $(shell pwd)/bin/kustomize
+.PHONY: kustomize
 kustomize: ## Download kustomize locally if necessary.
-ifeq (,$(wildcard $(KUSTOMIZE)))
-ifeq (,$(shell which kustomize 2>/dev/null))
-	@{ \
-	set -e ;\
-	mkdir -p $(dir $(KUSTOMIZE)) ;\
-	curl -sSLo - https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v4.5.7/kustomize_v4.5.7_$(OS)_$(ARCH).tar.gz | \
-	tar xzf - -C bin/ ;\
-	}
-else
-KUSTOMIZE = $(shell which kustomize)
-endif
-endif
+	@if [ ! -f ${KUSTOMIZE} ]; then \
+		BINDIR=$(shell pwd)/bin ./hack/download-kustomize; \
+	fi
 
-.PHONY: helm-operator
-HELM_OPERATOR = $(shell pwd)/bin/helm-operator
-helm-operator: ## Download helm-operator locally if necessary, preferring the $(pwd)/bin path over global if both exist.
-ifeq (,$(wildcard $(HELM_OPERATOR)))
-ifeq (,$(shell which helm-operator 2>/dev/null))
-	@{ \
-	set -e ;\
-	mkdir -p $(dir $(HELM_OPERATOR)) ;\
-	curl -sSLo $(HELM_OPERATOR) https://github.com/operator-framework/operator-sdk/releases/download/v1.32.0/helm-operator_$(OS)_$(ARCH) ;\
-	chmod +x $(HELM_OPERATOR) ;\
-	}
-else
-HELM_OPERATOR = $(shell which helm-operator)
-endif
-endif
+# go-get-tool will 'go install' any package $2 and install it to $1.
+PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
+define go-get-tool
+@[ -f $(1) ] || { \
+set -e ;\
+echo "Downloading $(2)" ;\
+GOBIN=$(PROJECT_DIR)/bin go install $(2) ;\
+}
+endef
 
+OPERATOR_SDK = $(shell pwd)/bin/operator-sdk
 .PHONY: operator-sdk
-OPERATOR_SDK ?= ./bin/operator-sdk
-operator-sdk: ## Download operator-sdk locally if necessary.
-ifeq (,$(wildcard $(OPERATOR_SDK)))
-ifeq (, $(shell which operator-sdk 2>/dev/null))
-	@{ \
-	set -e ;\
-	mkdir -p $(dir $(OPERATOR_SDK)) ;\
-	curl -sSLo $(OPERATOR_SDK) https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk_$(OS)_$(ARCH) ;\
-	chmod +x $(OPERATOR_SDK) ;\
-	}
-else
-OPERATOR_SDK = $(shell which operator-sdk)
-endif
-endif
-
-.PHONY: bundle
-bundle: kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
-	$(OPERATOR_SDK) generate kustomize manifests -q
-	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
-	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
-	$(OPERATOR_SDK) bundle validate ./bundle
+operator-sdk:
+	@if [ ! -f ${OPERATOR_SDK} ]; then \
+		set -e ;\
+		echo "Downloading ${OPERATOR_SDK}"; \
+		mkdir -p $(dir ${OPERATOR_SDK}) ;\
+		curl -Lo ${OPERATOR_SDK} 'https://github.com/operator-framework/operator-sdk/releases/download/v1.32.0/operator-sdk_linux_amd64'; \
+		chmod +x ${OPERATOR_SDK}; \
+	fi
 
 .PHONY: bundle-build
-bundle-build: ## Build the bundle image.
+bundle-build: operator-sdk manifests kustomize
+	rm -fr ./bundle
+	VERSION=$(shell echo $(PROJECT_VERSION) | sed 's/^v//') ${OPERATOR_SDK} generate kustomize manifests --apis-dir api
+	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
+	cd config/manager-base && $(KUSTOMIZE) edit set image controller=$(IMG)
+	OPERATOR_SDK="${OPERATOR_SDK}" \
+		     BUNDLE_GEN_FLAGS="${BUNDLE_GEN_FLAGS} --extra-service-accounts amd-gpu-operator-kmm-device-plugin,amd-gpu-operator-kmm-module-loader,amd-gpu-operator-node-labeller" \
+		     PKG=amd-gpu-operator \
+		     SOURCE_DIR=$(dir $(realpath $(lastword $(MAKEFILE_LIST)))) \
+		     KUBECTL_CMD=${KUBECTL_CMD} ./hack/generate-bundle
+	${OPERATOR_SDK} bundle validate ./bundle
 	docker build -f bundle.Dockerfile -t $(BUNDLE_IMG) .
 
 .PHONY: bundle-push
-bundle-push: ## Push the bundle image.
-	$(MAKE) docker-push IMG=$(BUNDLE_IMG)
+bundle-push:
+	docker push $(BUNDLE_IMG)
+
+.PHONY: bundle-save
+bundle-save:
+	docker save $(BUNDLE_IMG) | gzip > $(IMAGE_NAME)-olm-bundle.tar.gz
+
+.PHONY: bundle-scorecard-test
+bundle-scorecard-test:
+	${OPERATOR_SDK} scorecard --config bundle/tests/scorecard/config.yaml --kubeconfig ~/.kube/config $(BUNDLE_IMG)
+
+.PHONY: bundle-deploy
+bundle-deploy:
+	${OPERATOR_SDK} run bundle $(BUNDLE_IMG) --namespace=${BUNDLE_NAMESPACE}
+
+.PHONY: bundle-deploy-upgrade
+bundle-deploy-upgrade:
+	${OPERATOR_SDK} run bundle-upgrade $(BUNDLE_IMG)
+
+.PHONY: bundle-cleanup
+bundle-cleanup:
+	${OPERATOR_SDK} cleanup amd-gpu-operator --namespace=${BUNDLE_NAMESPACE}
 
 .PHONY: opm
 OPM = ./bin/opm
-opm: ## Download opm locally if necessary.
-ifeq (,$(wildcard $(OPM)))
-ifeq (,$(shell which opm 2>/dev/null))
-	@{ \
-	set -e ;\
-	mkdir -p $(dir $(OPM)) ;\
-	curl -sSLo $(OPM) https://github.com/operator-framework/operator-registry/releases/download/v1.23.0/$(OS)-$(ARCH)-opm ;\
-	chmod +x $(OPM) ;\
-	}
+opm:
+	@if [ ! -f ${OPM} ]; then \
+                set -e ;\
+                echo "Downloading ${OPM}"; \
+                mkdir -p $(dir ${OPM}) ;\
+                curl -Lo ${OPM}.tar 'https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-4.8/opm-linux.tar.gz'; \
+		tar -C $(dir ${OPM}) -xzf ${OPM}.tar; \
+                chmod +x ${OPM}; \
+		rm -f ${OPM}.tar; \
+        fi
+
+.PHONY: index
+index: opm
+	${OPM} index add --bundles ${BUNDLE_IMG} --tag ${INDEX_IMG}
+
+## Download and install helmify locally.
+HELMIFY = helmify
+
+.PHONY: helm
+helm:
+	if [ -z ${OPENSHIFT} ]; then \
+		$(MAKE) helm-k8s; \
+	else \
+		$(MAKE) helm-openshift; \
+	fi
+
+.PHONY: helm-k8s
+helm-k8s: manifests kustomize clean-helm-k8s gen-kmm-charts-k8s
+	$(KUSTOMIZE) build config/default | $(HELMIFY) helm-charts-k8s
+	# Patching k8s helm chart metadata
+	cp $(shell pwd)/hack/k8s-patch/metadata-patch/*.yaml $(shell pwd)/helm-charts-k8s/
+	cp $(shell pwd)/hack/k8s-patch/metadata-patch/*.md $(shell pwd)/helm-charts-k8s/
+	# Patching k8s helm chart template
+	cp $(shell pwd)/hack/k8s-patch/template-patch/* $(shell pwd)/helm-charts-k8s/templates/
+	# Removing OpenShift related rbac from vanilla k8s helm charts
+	rm $(shell pwd)/helm-charts-k8s/templates/kmm-device-plugin-rbac.yaml
+	rm $(shell pwd)/helm-charts-k8s/templates/kmm-module-loader-rbac.yaml
+	# Patching k8s helm chart kmm subchart
+	cp $(shell pwd)/hack/k8s-patch/k8s-kmm-patch/metadata-patch/*.yaml $(shell pwd)/helm-charts-k8s/charts/kmm/
+	cp $(shell pwd)/hack/k8s-patch/k8s-kmm-patch/template-patch/*.yaml $(shell pwd)/helm-charts-k8s/charts/kmm/templates/
+	cd $(shell pwd)/helm-charts-k8s; helm dependency update; helm lint; cd ..;
+	mkdir $(shell pwd)/helm-charts-k8s/crds
+	echo "moving crd yaml files to crds folder"
+	@for file in $(CRD_YAML_FILES); do \
+		helm template amd-gpu helm-charts-k8s -s templates/$$file > $(shell pwd)/helm-charts-k8s/crds/$$file; \
+	done
+	rm $(shell pwd)/helm-charts-k8s/templates/*crd.yaml
+	echo "dependency update, lint and pack charts"
+	cd $(shell pwd)/helm-charts-k8s; helm dependency update; helm lint; cd ..; helm package helm-charts-k8s/ --destination ./helm-charts-k8s
+	mv $(shell pwd)/helm-charts-k8s/gpu-operator-$(PROJECT_VERSION).tgz $(shell pwd)/helm-charts-k8s/gpu-operator-helm-k8s-$(PROJECT_VERSION).tgz
+
+.PHONY: helm-openshift
+helm-openshift: manifests kustomize clean-helm-openshift gen-nfd-charts-openshift gen-kmm-charts-openshift
+	$(KUSTOMIZE) build config/default | $(HELMIFY) helm-charts-openshift
+	# Patching openshift helm chart metadata
+	cp $(shell pwd)/hack/openshift-patch/metadata-patch/*.yaml $(shell pwd)/helm-charts-openshift/
+	# Patching openshift helm chart template
+	cp $(shell pwd)/hack/openshift-patch/template-patch/*.yaml $(shell pwd)/helm-charts-openshift/templates/
+	# Patching openshift helm chart nfd subchart
+	cp $(shell pwd)/hack/openshift-patch/openshift-nfd-patch/crds/* $(shell pwd)/helm-charts-openshift/charts/nfd/crds/
+	cp $(shell pwd)/hack/openshift-patch/openshift-nfd-patch/metadata-patch/* $(shell pwd)/helm-charts-openshift/charts/nfd/
+	# Patching openshift helm chart kmm subchart
+	cp $(shell pwd)/hack/openshift-patch/openshift-kmm-patch/template-patch/* $(shell pwd)/helm-charts-openshift/charts/kmm/templates/
+	cp $(shell pwd)/hack/openshift-patch/openshift-kmm-patch/metadata-patch/*.yaml $(shell pwd)/helm-charts-openshift/charts/kmm/
+	# opeartor already has device-plugin rbac yaml, removing the redundant rbac yaml from subchart
+	rm $(shell pwd)/helm-charts-openshift/charts/kmm/templates/device-plugin-rbac.yaml
+	# opeartor already has module-loader rbac yaml, removing the redundant rbac yaml from subchart
+	rm $(shell pwd)/helm-charts-openshift/charts/kmm/templates/module-loader-rbac.yaml
+	cd $(shell pwd)/helm-charts-openshift; helm dependency update; helm lint; cd ..;
+	mkdir $(shell pwd)/helm-charts-openshift/crds
+	echo "moving crd yaml files to crds folder"
+	@for file in $(CRD_YAML_FILES); do \
+		helm template amd-gpu helm-charts-openshift -s templates/$$file > $(shell pwd)/helm-charts-openshift/crds/$$file; \
+	done
+	rm $(shell pwd)/helm-charts-openshift/templates/*crd.yaml
+	echo "dependency update, lint and pack charts"
+	cd $(shell pwd)/helm-charts-openshift; helm dependency update; helm lint; cd ..; helm package helm-charts-openshift/ --destination ./helm-charts-openshift
+	mv $(shell pwd)/helm-charts-openshift/gpu-operator-$(PROJECT_VERSION).tgz $(shell pwd)/helm-charts-openshift/gpu-operator-helm-openshift-$(PROJECT_VERSION).tgz
+
+.PHONY: helm-install
+helm-install:
+	if [ -z ${OPENSHIFT} ]; then \
+		$(MAKE) helm-install-k8s; \
+	else \
+		$(MAKE) helm-install-openshift; \
+	fi
+
+.PHONY: helm-uninstall
+helm-uninstall:
+	if [ -z ${OPENSHIFT} ]; then \
+		$(MAKE) helm-uninstall-k8s; \
+	else \
+		$(MAKE) helm-uninstall-openshift; \
+	fi
+
+helm-install-openshift:
+	helm install amd-gpu-operator ${GPU_OPERATOR_CHART} -n kube-amd-gpu --create-namespace ${SKIP_NFD_CMD} ${SKIP_KMM_CMD} ${HELM_OC_CMD}
+
+helm-uninstall-openshift:
+	echo "Deleting all CRs before uninstalling operator..."
+	${KUBECTL_CMD} delete deviceconfigs.amd.com -n kube-amd-gpu --all
+	${KUBECTL_CMD} delete nodefeaturediscoveries.nfd.openshift.io -n kube-amd-gpu --all
+	echo "Uninstalling operator..."
+	helm uninstall amd-gpu-operator -n kube-amd-gpu
+
+helm-install-k8s:
+	helm install -f helm-charts-k8s/values.yaml amd-gpu-operator ${GPU_OPERATOR_CHART} -n kube-amd-gpu --create-namespace ${SKIP_NFD_CMD} ${SKIP_KMM_CMD} ${HELM_OC_CMD}
+
+helm-uninstall-k8s:
+	echo "Deleting all device configs before uninstalling operator..."
+	${KUBECTL_CMD} delete deviceconfigs.amd.com -n kube-amd-gpu --all
+	echo "Uninstalling operator..."
+	helm uninstall amd-gpu-operator -n kube-amd-gpu
+
+gen-nfd-charts-openshift:
+	rm -rf /tmp/nfd && git clone https://github.com/openshift/cluster-nfd-operator /tmp/nfd; cd /tmp/nfd; git checkout release-4.16
+	$(KUSTOMIZE) build /tmp/nfd/config/default | $(HELMIFY) helm-charts-openshift/charts/nfd
+	cp $(shell pwd)/hack/openshift-patch/openshift-nfd-patch/metadata-patch/Chart.yaml $(shell pwd)/helm-charts-openshift/charts/nfd/
+	mkdir helm-charts-openshift/charts/nfd/crds
+	@for file in $(OPENSHIFT_CLUSTER_NFD_CRD_YAML_FILES); do \
+		helm template amd-gpu helm-charts-openshift/charts/nfd -s templates/$$file > helm-charts-openshift/charts/nfd/crds/$$file; \
+	done
+	rm helm-charts-openshift/charts/nfd/templates/*crd.yaml
+	rm -rf /tmp/nfd
+
+gen-kmm-charts-openshift:
+	rm -rf /tmp/kmm && git clone https://github.com/rh-ecosystem-edge/kernel-module-management.git /tmp/kmm; cd /tmp/kmm; git checkout release-2.1
+	$(KUSTOMIZE) build /tmp/kmm/config/default | $(HELMIFY) helm-charts-openshift/charts/kmm
+	cp $(shell pwd)/hack/openshift-patch/openshift-kmm-patch/metadata-patch/Chart.yaml $(shell pwd)/helm-charts-openshift/charts/kmm/
+	mkdir helm-charts-openshift/charts/kmm/crds
+	@for file in $(OPENSHIFT_KMM_CRD_YAML_FILES); do \
+		helm template amd-gpu helm-charts-openshift/charts/kmm -s templates/$$file > helm-charts-openshift/charts/kmm/crds/$$file; \
+		rm helm-charts-openshift/charts/kmm/templates/$$file; \
+	done
+	rm -rf /tmp/kmm
+
+gen-kmm-charts-k8s:
+ifdef JOB_ID
+	@echo "Running in CI"
+	$(KUSTOMIZE) build /ws/builder/kernel-module-management/config/default | $(HELMIFY) helm-charts-k8s/charts/kmm
 else
-OPM = $(shell which opm)
+	rm -rf /tmp/kmm && git clone git@github.com:pensando/kernel-module-management.git /tmp/kmm; cd /tmp/kmm
+	$(KUSTOMIZE) build /tmp/kmm/config/default | $(HELMIFY) helm-charts-k8s/charts/kmm
+	rm -rf /tmp/kmm
 endif
-endif
+	cp $(shell pwd)/hack/k8s-patch/k8s-kmm-patch/metadata-patch/Chart.yaml $(shell pwd)/helm-charts-k8s/charts/kmm/
+	mkdir helm-charts-k8s/charts/kmm/crds
+	@for file in $(K8S_KMM_CRD_YAML_FILES); do \
+		helm template amd-gpu helm-charts-k8s/charts/kmm -s templates/$$file > helm-charts-k8s/charts/kmm/crds/$$file; \
+		rm helm-charts-k8s/charts/kmm/templates/$$file; \
+	done
 
-# A comma-separated list of bundle images (e.g. make catalog-build BUNDLE_IMGS=example.com/operator-bundle:v0.1.0,example.com/operator-bundle:v0.2.0).
-# These images MUST exist in a registry and be pull-able.
-BUNDLE_IMGS ?= $(BUNDLE_IMG)
+cert-manager-install:
+	helm repo add jetstack https://charts.jetstack.io --force-update
+	helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version v1.15.1 --set crds.enabled=true
 
-# The image tag given to the resulting catalog image (e.g. make catalog-build CATALOG_IMG=example.com/operator-catalog:v0.2.0).
-CATALOG_IMG ?= $(IMAGE_TAG_BASE)-catalog:v$(VERSION)
+cert-manager-uninstall:
+	helm uninstall cert-manager -n cert-manager
+	${KUBECTL_CMD} delete crd issuers.cert-manager.io clusterissuers.cert-manager.io certificates.cert-manager.io certificaterequests.cert-manager.io orders.acme.cert-manager.io challenges.acme.cert-manager.io
 
-# Set CATALOG_BASE_IMG to an existing catalog image tag to add $BUNDLE_IMGS to that image.
-ifneq ($(origin CATALOG_BASE_IMG), undefined)
-FROM_INDEX_OPT := --from-index $(CATALOG_BASE_IMG)
-endif
+clean-helm-openshift:
+	rm -rf $(shell pwd)/helm-charts-openshift
 
-# Build a catalog image by adding bundle images to an empty catalog using the operator package manager tool, 'opm'.
-# This recipe invokes 'opm' in 'semver' bundle add mode. For more information on add modes, see:
-# https://github.com/operator-framework/community-operators/blob/7f1438c/docs/packaging-operator.md#updating-your-existing-operator
-.PHONY: catalog-build
-catalog-build: opm ## Build a catalog image.
-	$(OPM) index add --container-tool docker --mode semver --tag $(CATALOG_IMG) --bundles $(BUNDLE_IMGS) $(FROM_INDEX_OPT)
+clean-helm-k8s:
+	rm -rf $(shell pwd)/helm-charts-k8s
 
-# Push the catalog image.
-.PHONY: catalog-push
-catalog-push: ## Push a catalog image.
-	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+copyrights:
+	GOFLAGS=-mod=mod go run tools/build/copyright/main.go && ./tools/build/check-local-files.sh
+
+docker/install_box:
+	@if [ ! -x /usr/local/bin/box ]; then echo "Installing box, sudo is required"; curl -sSL pm.test.pensando.io/tools/box-builder/install.sh | sudo bash; fi
+
+docker/build-test-container: docker/install_box
+	BOX_INCLUDE_ENV="FLATTEN" FLATTEN=1 box -n -t '${TEST_CONTAINER_URL}:${TEST_CONTAINER_VERSION}' box-deps.rb
+
+docker/release-test-container:
+	docker push '${TEST_CONTAINER_URL}:${TEST_CONTAINER_VERSION}'
+
