@@ -12,5 +12,5 @@ chmod 700 get_helm.sh
 # Install Helm Charts
 helm repo add rocm https://rocm.github.io/gpu-operator
 helm repo update
-helm install amd-gpu-operator rocm/gpu-operator --namespace kube-amd-gpu --create-namespace
+helm install amd-gpu-operator rocm/gpu-operator-charts --namespace kube-amd-gpu --create-namespace
 ```
