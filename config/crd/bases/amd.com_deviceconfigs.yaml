@@ -202,6 +202,10 @@ spec:
                       device plugin arguments is used to pass supported flags and their values while starting device plugin daemonset
                       supported flag values: {"resource_naming_strategy": {"single", "mixed"}}
                     type: object
+                  devicePluginHostNetwork:
+                    description: DevicePluginHostNetwork specifies whether to use
+                      host network namespace for the device plugin DaemonSet pods.
+                    type: boolean
                   devicePluginImage:
                     description: device plugin image
                     pattern: ^([a-z0-9]+(?:[._-][a-z0-9]+)*(:[0-9]+)?)(/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[a-z0-9._-]+)?(?:@[a-zA-Z0-9]+:[a-f0-9]+)?$
@@ -794,6 +798,10 @@ spec:
                     type: object
                   enable:
                     description: enable metrics exporter, disabled by default
+                    type: boolean
+                  hostNetwork:
+                    description: HostNetwork specifies whether to use host network
+                      namespace for the metrics exporter DaemonSet pods.
                     type: boolean
                   image:
                     description: metrics exporter image
